@@ -1,0 +1,24 @@
+[package]
+name = "diwa-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Mesh sync for diwa per-repo SQLite indexes — additive merge over SSH"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "diwa-sync"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "5"
+tempfile = "3"
+chrono = { version = "0.4", features = ["serde"] }
