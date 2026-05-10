@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use tracing::{info, warn};
 
 use diwa_sync::{config, merge, peer, state};
@@ -34,7 +33,10 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    init_tracing()?;
+    // The guard must outlive the last log call: when it drops, the appender
+    // worker flushes pending writes. Holding it in `main` until function-end
+    // ensures the final `diwa-sync done` line lands on disk.
+    let _log_guard = init_tracing()?;
 
     if matches!(cli.command, Some(Command::Init)) {
         return cmd_init();
@@ -43,20 +45,15 @@ fn main() -> Result<()> {
     run_sync(&cli)
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = config::log_dir()?;
     std::fs::create_dir_all(&log_dir)?;
-    // We log to stderr (captured by launchd) AND a per-run file. tracing's
-    // default subscriber to stderr is fine; the file is opened up front so we
-    // can later cat it for debugging.
+    // Log to stderr (captured by launchd) AND a per-run file.
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let log_file = log_dir.join(format!("{stamp}.log"));
     let file = std::fs::File::create(&log_file)
         .with_context(|| format!("create log file {}", log_file.display()))?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
-    // We can't keep `guard` alive easily without a global; leak it for the
-    // process lifetime. This is fine for a short-lived CLI.
-    Box::leak(Box::new(guard));
 
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let env = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -65,7 +62,7 @@ fn init_tracing() -> Result<()> {
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
-    Ok(())
+    Ok(guard)
 }
 
 fn cmd_init() -> Result<()> {
@@ -318,29 +315,30 @@ fn push_seed(
     Ok(())
 }
 
-/// Single-instance lock via mkdir (atomic on POSIX). Returns a guard that
-/// removes the dir on drop.
+/// Single-instance lock via `flock(2)`. The kernel releases the lock when
+/// the file descriptor is closed — including on SIGKILL or panic — so a
+/// crashed run never leaves a stale lock that blocks subsequent ticks.
+/// (The previous mkdir-based lock had this failure mode in the wild.)
 fn acquire_lock() -> Result<LockGuard> {
-    let dir = config::lock_dir()?;
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::create_dir(&dir) {
-        Ok(()) => Ok(LockGuard { path: dir }),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(anyhow!("lock {} already held", dir.display()))
-        }
-        Err(e) => Err(e.into()),
+    use fs2::FileExt;
+    let dir = config::sync_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(LockGuard { _file: file }),
+        Err(_) => Err(anyhow!("lock {} already held by another diwa-sync", path.display())),
     }
 }
 
 struct LockGuard {
-    path: PathBuf,
-}
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.path);
-    }
+    // Kernel releases the flock when this FD closes (Drop / process exit).
+    _file: std::fs::File,
 }
 
 fn hostname() -> String {

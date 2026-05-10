@@ -72,7 +72,10 @@ The default plist fires at `:04`, `:14`, `:24`, `:34`, `:44`, `:54` of each hour
 | Inspect a run | `~/.diwa-sync/log/<timestamp>.log` (per-run) and `launchd.{out,err}.log` |
 | Stop the cron | `launchctl unload ~/Library/LaunchAgents/diwa-sync.plist` |
 
-A schema mismatch between local and peer (e.g. one machine on a newer diwa with a new column) is detected and that repo is **skipped with a clear error** rather than silently dropping data — search the log for `schema mismatch on \`insights\``.
+Two schema problems are detected pre-merge and surface as **clear, skipped-with-error** outcomes rather than silent corruption:
+
+- **Schema mismatch** between local and peer (e.g. one machine on a newer diwa with a new column) — search logs for `schema mismatch on \`insights\``.
+- **Missing dedup index** on the local DB — without a `UNIQUE INDEX` over `(commit_sha, title, source_type)`, `INSERT OR IGNORE` has nothing to dedupe against and would append peer rows on every tick. The error tells you exactly what to run: `CREATE UNIQUE INDEX idx_insights_unique ON insights (commit_sha, title, source_type);`
 
 ## What is NOT synced
 

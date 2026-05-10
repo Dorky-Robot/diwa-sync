@@ -65,7 +65,3 @@ pub fn state_path() -> Result<PathBuf> {
 pub fn log_dir() -> Result<PathBuf> {
     Ok(sync_dir()?.join("log"))
 }
-
-pub fn lock_dir() -> Result<PathBuf> {
-    Ok(sync_dir()?.join("lock.d"))
-}

@@ -1,6 +1,6 @@
 [package]
 name = "diwa-sync"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Mesh sync for diwa per-repo SQLite indexes — additive merge over SSH"
 license = "MIT OR Apache-2.0"
@@ -22,3 +22,4 @@ tracing-appender = "0.2"
 dirs = "5"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"

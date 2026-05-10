@@ -3,14 +3,25 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-/// Hardcoded SSH options for every connection. BatchMode rejects password
-/// prompts (we want fast failures, not hangs); ConnectTimeout caps DNS+TCP.
+/// Hardcoded SSH options for every connection.
+/// - BatchMode rejects password prompts (fast failure, not hangs).
+/// - ConnectTimeout caps DNS+TCP.
+/// - ControlMaster + ControlPersist multiplex repeated connections to the
+///   same host through a single TCP/auth session, which collapses ~144
+///   handshakes/tick down to ~2. Saves ~30s per tick at our scale.
 fn ssh_args(host: &str) -> Vec<String> {
     vec![
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
         "ConnectTimeout=5".into(),
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        "ControlPersist=60s".into(),
+        // %C is a hash of host+port+user — collision-free per peer.
+        "-o".into(),
+        "ControlPath=~/.ssh/diwa-sync-cm-%C".into(),
         host.into(),
     ]
 }
@@ -81,11 +92,14 @@ pub fn snapshot(host: &str, repo_key: &str, dest: &Path) -> Result<()> {
     validate_repo_key(repo_key)?;
 
     // Step 1: ask peer to produce a snapshot in its /tmp, echo back the path.
+    // -cmd "PRAGMA busy_timeout=30000" widens the .backup wait from the
+    // default ~5s to 30s, eliminating the rare "database is locked" we saw
+    // when a peer's diwa daemon was actively writing.
     let remote_cmd = format!(
         r#"set -e
 tmp=$(mktemp /tmp/diwa-sync-snap.XXXXXX) || exit 1
 trap 'rm -f "$tmp"' ERR
-sqlite3 "$HOME/.diwa/{key}/index.db" ".backup '$tmp'" >/dev/null
+sqlite3 -cmd "PRAGMA busy_timeout=30000" "$HOME/.diwa/{key}/index.db" ".backup '$tmp'" >/dev/null
 echo "$tmp"
 "#,
         key = repo_key
@@ -198,6 +212,8 @@ pub fn local_snapshot(local_db: &Path, dest: &Path) -> Result<()> {
     // our control, but we still build the SQL through the CLI carefully.
     let backup_sql = format!(".backup '{}'", dest_str.replace('\'', "''"));
     let status = Command::new("/usr/bin/sqlite3")
+        .arg("-cmd")
+        .arg("PRAGMA busy_timeout=30000")
         .arg(local_str)
         .arg(&backup_sql)
         .status()

@@ -122,33 +122,28 @@ fn require_dedup_index(conn: &Connection) -> Result<()> {
     // Look for a unique index on `insights` that covers exactly the dedup
     // columns. SQLite may give it any name (we use `idx_insights_unique` by
     // convention but tolerate alternatives).
-    let mut stmt = conn.prepare(
-        "SELECT name FROM main.sqlite_master \
-         WHERE type='index' AND tbl_name='insights'",
-    )?;
-    let names: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-
     let dedup_cols: std::collections::BTreeSet<&str> =
         ["commit_sha", "title", "source_type"].into_iter().collect();
 
-    for name in &names {
+    // Build a single (name → unique?) map via PRAGMA index_list, then probe
+    // each unique index's columns via PRAGMA index_info. Hoists the prior
+    // per-iteration prepare of index_list out of the loop.
+    let mut list = conn.prepare("PRAGMA main.index_list('insights')")?;
+    let unique_indexes: Vec<String> = list
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+        .filter_map(Result::ok)
+        .filter(|(_, u)| *u == 1)
+        .map(|(name, _)| name)
+        .collect();
+
+    for name in &unique_indexes {
         // PRAGMA index_info → cid, seqno, name (column name)
         let mut info = conn.prepare(&format!("PRAGMA main.index_info('{}')", name))?;
         let cols: std::collections::BTreeSet<String> = info
             .query_map([], |r| r.get::<_, String>(2))?
             .collect::<rusqlite::Result<_>>()?;
 
-        // PRAGMA index_list reveals whether this index is UNIQUE.
-        let mut list = conn.prepare("PRAGMA main.index_list('insights')")?;
-        let unique: bool = list
-            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
-            .filter_map(Result::ok)
-            .any(|(n, u)| n == *name && u == 1);
-
-        if unique
-            && cols.len() == dedup_cols.len()
+        if cols.len() == dedup_cols.len()
             && cols.iter().map(|s| s.as_str()).collect::<std::collections::BTreeSet<_>>()
                 == dedup_cols
         {
