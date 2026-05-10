@@ -119,6 +119,47 @@ fn merge_idempotent() {
 }
 
 #[test]
+fn merge_rejects_missing_dedup_index() {
+    // Same schema on both sides but local has no UNIQUE index — would cause
+    // unbounded duplicate growth, so merge must refuse.
+    let tmp = TempDir::new().unwrap();
+    let local_path = tmp.path().join("local.db");
+    let peer_path = tmp.path().join("peer.db");
+
+    let no_index_schema = r#"
+        CREATE TABLE insights (
+            id          INTEGER PRIMARY KEY,
+            commit_sha  TEXT NOT NULL,
+            commit_date TEXT NOT NULL,
+            category    TEXT NOT NULL,
+            title       TEXT NOT NULL,
+            body        TEXT NOT NULL,
+            files       TEXT NOT NULL DEFAULT '[]',
+            tags        TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT 'git',
+            pr_number   INTEGER,
+            embedding   BLOB,
+            created_at  TEXT NOT NULL
+        );
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE VIRTUAL TABLE insights_fts USING fts5(
+            title, body, tags, content=insights, content_rowid=id
+        );
+    "#;
+    Connection::open(&local_path).unwrap().execute_batch(no_index_schema).unwrap();
+    let peer = make_db(&peer_path);
+    insert(&peer, "x", "T", "B");
+    drop(peer);
+
+    let err = merge_into(&local_path, &peer_path).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("UNIQUE index"),
+        "expected dedup-index error, got: {msg}"
+    );
+}
+
+#[test]
 fn merge_rejects_schema_mismatch() {
     let tmp = TempDir::new().unwrap();
     let local_path = tmp.path().join("local.db");

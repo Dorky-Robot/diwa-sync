@@ -50,6 +50,7 @@ pub fn merge_into(local_db: &Path, peer_db: &Path) -> Result<MergeStats> {
         .context("ATTACH peer database")?;
 
     schema_compatible(&conn).context("schema compatibility check")?;
+    require_dedup_index(&conn).context("dedup index check")?;
 
     let local_before: i64 =
         conn.query_row("SELECT count(*) FROM insights", [], |r| r.get(0))?;
@@ -110,6 +111,58 @@ fn schema_compatible(conn: &Connection) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Refuse to merge if the local `insights` table has no UNIQUE index covering
+/// `(commit_sha, title, source_type)`. Without it, `INSERT OR IGNORE` has no
+/// constraint to dedupe against and every peer row gets blindly appended,
+/// causing unbounded growth on every tick. (Discovered in the wild on a repo
+/// whose schema was created before diwa added the migration; see git log.)
+fn require_dedup_index(conn: &Connection) -> Result<()> {
+    // Look for a unique index on `insights` that covers exactly the dedup
+    // columns. SQLite may give it any name (we use `idx_insights_unique` by
+    // convention but tolerate alternatives).
+    let mut stmt = conn.prepare(
+        "SELECT name FROM main.sqlite_master \
+         WHERE type='index' AND tbl_name='insights'",
+    )?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let dedup_cols: std::collections::BTreeSet<&str> =
+        ["commit_sha", "title", "source_type"].into_iter().collect();
+
+    for name in &names {
+        // PRAGMA index_info → cid, seqno, name (column name)
+        let mut info = conn.prepare(&format!("PRAGMA main.index_info('{}')", name))?;
+        let cols: std::collections::BTreeSet<String> = info
+            .query_map([], |r| r.get::<_, String>(2))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // PRAGMA index_list reveals whether this index is UNIQUE.
+        let mut list = conn.prepare("PRAGMA main.index_list('insights')")?;
+        let unique: bool = list
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+            .filter_map(Result::ok)
+            .any(|(n, u)| n == *name && u == 1);
+
+        if unique
+            && cols.len() == dedup_cols.len()
+            && cols.iter().map(|s| s.as_str()).collect::<std::collections::BTreeSet<_>>()
+                == dedup_cols
+        {
+            return Ok(());
+        }
+    }
+
+    Err(anyhow!(
+        "local `insights` table is missing a UNIQUE index over \
+         (commit_sha, title, source_type) — INSERT OR IGNORE has nothing to \
+         dedupe against, so merging would corrupt the DB with unbounded duplicates. \
+         Run: sqlite3 <path> \"CREATE UNIQUE INDEX idx_insights_unique ON insights \
+         (commit_sha, title, source_type);\" (deduplicate first if needed)."
+    ))
 }
 
 fn table_columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<String>> {
